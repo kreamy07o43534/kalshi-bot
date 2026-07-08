@@ -35,6 +35,7 @@ time. With GUILD_ID they appear instantly in that one server.)
 ------------------------------------------------------------------------------
 """
 import asyncio
+
 import functools
 import os
 import time
@@ -45,6 +46,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import kalshi_bot as kb   # the engine (must be in the same folder)
+kb.WETHR_KEY = os.environ.get("WETHR_API_KEY")
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = os.environ.get("GUILD_ID")
