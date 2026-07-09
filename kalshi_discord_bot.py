@@ -330,15 +330,15 @@ async def calibrate(interaction: discord.Interaction, years: float = 2.0, only: 
     bot.loop.create_task(worker())
 
 @bot.tree.command(name="histtest", description="Backtest forecast accuracy vs 1-2 years of actual temps")
-@app_commands.describe(city="One city (fast), e.g. LAX. Blank = all cities (slow).",
+@app_commands.describe(city="One city code (e.g. LAX), or '20' for all 20 cities (slow).",
                        years="Years of history: 1 or 2 (default 1)",
                        bucket="Bracket width in degrees F (1 or 2, default 2)")
-async def histtest(interaction: discord.Interaction, city: str = "", years: float = 1.0, bucket: int = 2):
+async def histtest(interaction: discord.Interaction, city: str = "20", years: float = 1.0, bucket: int = 2):
     only = None
-    if city and city.strip():
+    if city != "20":
         c = city.upper().strip()
         if c not in kb.STATIONS:
-            await interaction.response.send_message(f"Unknown city: {c}", ephemeral=True)
+            await interaction.response.send_message(f"Unknown city: {c}. Use '20' for all cities.", ephemeral=True)
             return
         only = [c]
     bucket = 2 if bucket not in (1, 2) else bucket
