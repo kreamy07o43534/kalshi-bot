@@ -125,17 +125,21 @@ OM_ENS = "https://ensemble-api.open-meteo.com/v1/ensemble"
 OM_HIST = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 KALSHI = "https://external-api.kalshi.com/trade-api/v2"
 IEM_ASOS = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-WETHR = "https://api.wethr.net/api/v2"
+WETHR = "https://wethr.net/api/v2"
 WETHR_KEY = os.environ.get("WETHR_API_KEY")  # optional; pulls from env if set
+_wethr_notified = set()
 
 # ===========================================================================
 # SHARED HELPERS
 # ===========================================================================
-def http_json(url, params=None, tries=4, timeout=30, pause=0.4):
+def http_json(url, params=None, tries=4, timeout=30, pause=0.4, headers=None):
+    hdr = dict(UA)
+    if headers:
+        hdr.update(headers)
     last = None
     for i in range(tries):
         try:
-            r = requests.get(url, params=params, headers=UA, timeout=timeout)
+            r = requests.get(url, params=params, headers=hdr, timeout=timeout)
             if r.status_code == 404:
                 r.raise_for_status()
             if r.status_code >= 500 or r.status_code == 429:
@@ -211,33 +215,31 @@ def iem_tmpf_daily(cfg, start_dt, end_dt):
             continue
     return {d: v for d, v in daily.items() if v[0] > -900 and v[1] < 900}
 
-def wethr_forecast(station_code):
-    """Fetch Wethr High/Low forecast + model data for a station. Returns dict or None."""
-    if not WETHR_KEY:
-        return None
-    try:
-        # Wethr observations endpoint: returns wethr_high, wethr_low in NWS logic
-        data = http_json(f"{WETHR}/observations.php", params={
-            "station_code": station_code, "mode": "wethr_high", "logic": "nws",
-            "api_key": WETHR_KEY
-        })
-        return data
-    except Exception:
-        return None
+def _wethr_note(msg):
+    """Print a Wethr status line once per process (visible in Railway logs)."""
+    if msg not in _wethr_notified:
+        _wethr_notified.add(msg)
+        print(msg, flush=True)
 
-def wethr_model_data(station_code):
-    """Fetch Wethr forecast model data (all 16+ models). Returns dict or None."""
+def wethr_confirmed(station_code):
+    """Confirmed Wethr High/Low so far for the current trading day (NWS logic).
+    Returns (high, low) or (None, None). Used as a same-day clamp on the forecast:
+    the day's high can't end up below what's already been reached, and vice versa.
+    Auth is a Bearer token header, base host is wethr.net."""
     if not WETHR_KEY:
-        return None
+        return None, None
     try:
-        data = http_json(f"{WETHR}/forecasts.php", params={
-            "station_code": station_code, "mode": "daily",
-            "tz_mode": "standard",  # Kalshi uses standard time
-            "api_key": WETHR_KEY
-        })
-        return data
-    except Exception:
-        return None
+        data = http_json(f"{WETHR}/observations.php",
+                         params={"station_code": station_code,
+                                 "mode": "wethr_high", "logic": "nws"},
+                         headers={"Authorization": f"Bearer {WETHR_KEY}"})
+        hi, lo = data.get("wethr_high"), data.get("wethr_low")
+        _wethr_note(f"[wethr] connected OK (sample {station_code}: H{hi}/L{lo})")
+        return (float(hi) if hi is not None else None,
+                float(lo) if lo is not None else None)
+    except Exception as ex:
+        _wethr_note(f"[wethr] request failed ({station_code}): {ex} — running without Wethr")
+        return None, None
 
 # ===========================================================================
 # COMMAND: discover  — list real Kalshi series tickers
@@ -430,23 +432,16 @@ def pattern_side_mult(pattern, code, side):
         return 0.85
     return 1.0
 
-def blend(nws_v, ens_center, wethr_v=None):
-    """Blend NWS, ensemble, and optionally Wethr (3-way blend if Wethr available)."""
+def blend(nws_v, ens_center):
     base = SETTINGS["nws_weight_base"]
-    if wethr_v is not None:
-        # 3-way blend: NWS 40%, ensemble 35%, Wethr 25% (Wethr is already blended, lighter weight)
-        center = 0.40 * nws_v + 0.35 * ens_center + 0.25 * wethr_v
-        disagree = max(abs(nws_v - ens_center), abs(nws_v - wethr_v), abs(ens_center - wethr_v))
+    disagree = abs(nws_v - ens_center)
+    if disagree < SETTINGS["disagree_soft"]:
+        w = base - 0.15
+    elif disagree > SETTINGS["disagree_hard"]:
+        w = 0.5
     else:
-        # 2-way blend: NWS + ensemble (original logic)
-        disagree = abs(nws_v - ens_center)
-        if disagree < SETTINGS["disagree_soft"]:
-            w = base - 0.15
-        elif disagree > SETTINGS["disagree_hard"]:
-            w = 0.5
-        else:
-            w = base
-        center = w * nws_v + (1 - w) * ens_center
+        w = base
+    center = w * nws_v + (1 - w) * ens_center
     agree_mult = 1.0 / (1.0 + disagree / SETTINGS["disagree_hard"])
     return center, disagree, agree_mult
 
@@ -467,24 +462,27 @@ def score_city(code, cfg, target, bucket, sigmas, use_afd=True):
     ens_hi_s = ens["hi_spread"] if ens else None
     ens_lo_s = ens["lo_spread"] if ens else None
     
-    # Fetch Wethr data if available
-    wethr_hi, wethr_lo = None, None
-    try:
-        wethr_obs = wethr_forecast(cfg["settle"])
-        if wethr_obs:
-            wethr_hi = wethr_obs.get("wethr_high")
-            wethr_lo = wethr_obs.get("wethr_low")
-    except Exception:
-        pass
-    
+    # Wethr confirmed High/Low so far (same-day only) -> hard clamp on the forecast
+    w_hi, w_lo = wethr_confirmed(cfg["settle"])
+    lst_today = (datetime.now(timezone.utc) + std_offset(cfg["tz"])).strftime("%Y-%m-%d")
+    is_today = (target == lst_today)
+
     season = season_of(target)
     alert = nws_alerts(cfg)
     alert_mult = SETTINGS["alert_multiplier"] if alert else 1.0
     afd_mult, pattern = afd_analyze(cfg) if use_afd else (1.0, None)
     half = bucket / 2.0
 
-    def one(side, nws_v, ens_c, ens_s, wethr_v=None):
-        center, disagree, agree_mult = blend(nws_v, ens_c, wethr_v)
+    def one(side, nws_v, ens_c, ens_s, wconf=None):
+        center, disagree, agree_mult = blend(nws_v, ens_c)
+        # Same-day clamp: today's high can't finish below a temp already reached,
+        # and today's low can't finish above a temp already reached.
+        clamped = False
+        if is_today and wconf is not None:
+            if side == "high" and wconf > center:
+                center, clamped = wconf, True
+            elif side == "low" and wconf < center:
+                center, clamped = wconf, True
         sigma = eff_sigma(climo_sigma(sigmas, code, side, season), ens_s)
         point = int(round(center))
         p_bucket = interval_prob(point - half, point + half, center, sigma)
@@ -493,10 +491,10 @@ def score_city(code, cfg, target, bucket, sigmas, use_afd=True):
         return dict(side=side.upper(), center=round(center,1), sigma=round(sigma,2),
                     point=point, p_bucket=p_bucket, conf=min(conf, 0.99),
                     nws=round(nws_v,1), ens=round(ens_c,1), disagree=round(disagree,1),
-                    wethr=round(wethr_v,1) if wethr_v else None)
+                    wethr=round(wconf,1) if wconf is not None else None, clamped=clamped)
 
-    hi = one("high", nws_hi, ens_hi_c, ens_hi_s, wethr_hi)
-    lo = one("low",  nws_lo, ens_lo_c, ens_lo_s, wethr_lo)
+    hi = one("high", nws_hi, ens_hi_c, ens_hi_s, w_hi)
+    lo = one("low",  nws_lo, ens_lo_c, ens_lo_s, w_lo)
     best = hi if hi["conf"] >= lo["conf"] else lo
     return dict(code=code, settle=cfg["settle"], target=target, alert=alert,
                 pattern=pattern, best=best, hi=hi, lo=lo)
@@ -586,17 +584,26 @@ def cmd_scan(args):
         return
     picks.sort(key=lambda r: r["best"]["conf"], reverse=True)
 
-    print("\n" + "="*74)
+    # Expand to BOTH sides -> 40 ranked rows (each city's high AND low)
+    rows = []
+    for r in picks:
+        for sd in ("hi", "lo"):
+            rows.append(dict(code=r["code"], settle=r["settle"], b=r[sd],
+                             pattern=r["pattern"], alert=r["alert"]))
+    rows.sort(key=lambda x: x["b"]["conf"], reverse=True)
+
+    print("\n" + "="*78)
     print(f"{'RK':<3}{'CITY':<6}{'STN':<6}{'SIDE':<5}{'EST':<5}{'CONF':<8}{'SIG':<6}{'NOTE'}")
-    print("-"*74)
-    for i, r in enumerate(picks, 1):
-        b = r["best"]; note = []
-        if r["pattern"]: note.append(r["pattern"])
-        if r["alert"]: note.append("ALERT")
-        if b["disagree"] > 2.5: note.append(f"split{b['disagree']}")
-        print(f"{i:<3}{r['code']:<6}{r['settle']:<6}{b['side']:<5}{b['point']:<5}"
+    print("-"*78)
+    for i, x in enumerate(rows, 1):
+        b = x["b"]; note = []
+        if x["pattern"]: note.append(x["pattern"])
+        if x["alert"]: note.append("ALERT")
+        if b["disagree"] > 2.5: note.append("split")
+        if b.get("clamped"): note.append("wethr-clamp")
+        print(f"{i:<3}{x['code']:<6}{x['settle']:<6}{b['side']:<5}{b['point']:<5}"
               f"{b['conf']*100:5.1f}%  {b['sigma']:<5.1f} {','.join(note)}")
-    print("="*74)
+    print("="*78)
 
     for r in picks[:args.top]:
         b = r["best"]
@@ -707,6 +714,61 @@ def cmd_backtest(args):
     print()
 
 # ===========================================================================
+# COMMAND: histtest  — accuracy of the forecast vs 1-2 years of actual temps
+# ===========================================================================
+def cmd_histtest(args):
+    codes = args.only if args.only else list(STATIONS.keys())
+    half = args.bucket / 2.0
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=int(365 * args.years))
+    print(f"\nHistorical accuracy test — {args.years}y, {args.bucket}F bucket")
+    print("(Open-Meteo archived forecast vs IEM actual settlement temps)\n")
+    tot = dict(hh=0, hn=0, hae=0.0, lh=0, ln=0, lae=0.0)
+    per = []
+    for code in codes:
+        cfg = STATIONS[code]
+        print(f"  testing {code} ({cfg['settle']}) ...", flush=True)
+        try:
+            actual = iem_tmpf_daily(cfg, start, end)
+            fcst = fetch_om_forecasts(cfg, start, end)
+        except Exception as e:
+            print(f"     failed: {e}"); continue
+        hh = hn = lh = ln = 0; hae = lae = 0.0
+        for d, (ahi, alo) in actual.items():
+            if d not in fcst:
+                continue
+            fhi, flo = fcst[d]
+            hn += 1; hae += abs(ahi - fhi)
+            if (round(fhi) - half) <= round(ahi) <= (round(fhi) + half):
+                hh += 1
+            ln += 1; lae += abs(alo - flo)
+            if (round(flo) - half) <= round(alo) <= (round(flo) + half):
+                lh += 1
+        if hn == 0:
+            print("     no overlapping data"); continue
+        per.append(dict(code=code, hi=hh/hn, lo=lh/ln, hmae=hae/hn, lmae=lae/ln, n=hn))
+        for k, v in (("hh",hh),("hn",hn),("hae",hae),("lh",lh),("ln",ln),("lae",lae)):
+            tot[k] += v
+        print(f"     HIGH {hh/hn*100:.0f}% hit (MAE {hae/hn:.1f}F)   "
+              f"LOW {lh/ln*100:.0f}% hit (MAE {lae/ln:.1f}F)   n={hn}")
+    if not per:
+        print("\nNo data."); return
+    per.sort(key=lambda x: (x["hi"] + x["lo"]) / 2, reverse=True)
+    print("\n" + "="*72)
+    print(f"{'CITY':<6}{'STN':<6}{'HIGH-hit':<10}{'H-MAE':<8}{'LOW-hit':<10}{'L-MAE':<8}{'days'}")
+    print("-"*72)
+    for x in per:
+        print(f"{x['code']:<6}{STATIONS[x['code']]['settle']:<6}"
+              f"{x['hi']*100:>6.0f}%   {x['hmae']:<7.1f}{x['lo']*100:>6.0f}%   "
+              f"{x['lmae']:<7.1f}{x['n']}")
+    print("-"*72)
+    print(f"OVERALL HIGH: {tot['hh']/tot['hn']*100:.1f}% hit, MAE {tot['hae']/tot['hn']:.1f}F")
+    print(f"OVERALL LOW:  {tot['lh']/tot['ln']*100:.1f}% hit, MAE {tot['lae']/tot['ln']:.1f}F")
+    print("="*72)
+    print("Higher hit% and lower MAE = easier to predict. This is the forecast's raw")
+    print("accuracy (the bot's realistic ceiling before Kalshi pricing).\n")
+
+# ===========================================================================
 # CLI
 # ===========================================================================
 def build_parser():
@@ -734,11 +796,17 @@ def build_parser():
     b = sub.add_parser("backtest", help="score logged picks vs actuals")
     b.add_argument("--bucket", type=int, default=2, choices=[1, 2])
     b.set_defaults(func=cmd_backtest)
+
+    h = sub.add_parser("histtest", help="test forecast accuracy vs 1-2yr of actual temps")
+    h.add_argument("--years", type=float, default=1.0, help="years of history (1 or 2)")
+    h.add_argument("--bucket", type=int, default=2, choices=[1, 2])
+    h.add_argument("--only", nargs="*", default=None, help="subset of city codes")
+    h.set_defaults(func=cmd_histtest)
     return p
 
 def main():
     parser = build_parser()
-    known = {"scan", "calibrate", "discover", "backtest", "-h", "--help"}
+    known = {"scan", "calibrate", "discover", "backtest", "histtest", "-h", "--help"}
     argv = sys.argv[1:]
     if not argv or argv[0] not in known:   # default to `scan`
         argv = ["scan"] + argv

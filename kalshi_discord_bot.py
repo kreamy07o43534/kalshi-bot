@@ -35,7 +35,6 @@ time. With GUILD_ID they appear instantly in that one server.)
 ------------------------------------------------------------------------------
 """
 import asyncio
-
 import functools
 import os
 import time
@@ -46,7 +45,7 @@ from discord import app_commands
 from discord.ext import commands
 
 import kalshi_bot as kb   # the engine (must be in the same folder)
-kb.WETHR_KEY = os.environ.get("WETHR_API_KEY")
+kb.WETHR_KEY = os.environ.get("WETHR_API_KEY")  # propagate Wethr key to the engine
 
 TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = os.environ.get("GUILD_ID")
@@ -118,6 +117,28 @@ def perform_calibrate(years, only):
         kb.cmd_calibrate(a)
     return buf.getvalue()
 
+def perform_histtest(years, bucket, only):
+    import io, contextlib
+    buf = io.StringIO()
+
+    class A:
+        pass
+    a = A(); a.years = years; a.bucket = bucket; a.only = only
+    with contextlib.redirect_stdout(buf):
+        kb.cmd_histtest(a)
+    return buf.getvalue()
+
+def chunk_text(text, n=1900):
+    """Split long text into <2000-char blocks on line boundaries for Discord."""
+    out, buf = [], ""
+    for ln in text.splitlines():
+        if len(buf) + len(ln) + 1 > n:
+            out.append(buf); buf = ""
+        buf += ln + "\n"
+    if buf.strip():
+        out.append(buf)
+    return out
+
 async def run_blocking(fn, *a):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, functools.partial(fn, *a))
@@ -151,11 +172,13 @@ def pick_embed(r, details, bucket, day_label):
     e.add_field(name="Estimate", value=f"**{b['point']}°F**  (bracket {rng})", inline=True)
     e.add_field(name="Confidence", value=f"**{b['conf']*100:.1f}%**", inline=True)
     e.add_field(name="σ (spread)", value=f"{b['sigma']:.1f}°F", inline=True)
-    model_str = f"NWS {b['nws']:.0f} vs ensemble {b['ens']:.1f}"
-    if b.get("wethr"):
-        model_str += f" vs Wethr {b['wethr']:.0f}"
-    e.add_field(name="Model check", value=model_str + f" (Δ{b['disagree']:.1f})", inline=False)
+    model_str = f"NWS {b['nws']:.0f} vs ensemble {b['ens']:.1f} (Δ{b['disagree']:.1f})"
+    if b.get("wethr") is not None:
+        model_str += f"\nWethr confirmed so far: **{b['wethr']:.0f}°F**"
+    e.add_field(name="Model check", value=model_str, inline=False)
     notes = []
+    if b.get("clamped"):
+        notes.append("🔒 **Wethr clamp** — estimate pinned to a temp already reached today")
     if r["pattern"]:
         notes.append(f"⚠️ pattern: **{r['pattern']}**")
     if r["alert"]:
@@ -171,19 +194,30 @@ def pick_embed(r, details, bucket, day_label):
     return e
 
 def scan_embed(picks, bucket, day_label):
-    lines = [f"{'#':<2} {'CITY':<5}{'STN':<5}{'SD':<4}{'EST':<5}{'CONF':<7}{'NOTE'}"]
-    for i, r in enumerate(picks, 1):
-        b = r["best"]; note = []
+    # Expand to BOTH sides -> 40 ranked rows (each city's high AND low)
+    rows = []
+    for r in picks:
+        for sd in ("hi", "lo"):
+            rows.append((r, r[sd]))
+    rows.sort(key=lambda x: x[1]["conf"], reverse=True)
+    header = f"{'#':<3}{'CITY':<5}{'STN':<5}{'SD':<3}{'EST':<5}{'CONF':<6}{'NOTE'}"
+    lines = []
+    for i, (r, b) in enumerate(rows, 1):
+        note = []
         if r["pattern"]: note.append(r["pattern"][:4])
-        if r["alert"]: note.append("ALERT")
-        if b["disagree"] > 2.5: note.append("split")
-        lines.append(f"{i:<2} {r['code']:<5}{r['settle']:<5}{b['side'][:1]:<4}"
-                     f"{b['point']:<5}{b['conf']*100:4.0f}%  {','.join(note)}")
-    table = "```\n" + "\n".join(lines) + "\n```"
-    e = discord.Embed(title=f"📊 Kalshi temp ranking — {day_label}",
-                      description=table, color=0x2ECC71,
-                      timestamp=datetime.now(timezone.utc))
-    e.set_footer(text="Top of the list = highest confidence · /pick for the detail")
+        if r["alert"]: note.append("alert")
+        if b.get("clamped"): note.append("wclmp")
+        lines.append(f"{i:<3}{r['code']:<5}{r['settle']:<5}{b['side'][:1]:<3}"
+                     f"{b['point']:<5}{b['conf']*100:4.0f}% {','.join(note)}")
+    # split into two columns of ~20 to stay well under embed limits
+    mid = (len(lines) + 1) // 2
+    col1 = "```\n" + header + "\n" + "\n".join(lines[:mid]) + "\n```"
+    col2 = "```\n" + header + "\n" + "\n".join(lines[mid:]) + "\n```"
+    e = discord.Embed(title=f"📊 Kalshi temp ranking (40 = highs + lows) — {day_label}",
+                      color=0x2ECC71, timestamp=datetime.now(timezone.utc))
+    e.add_field(name="Rank 1–20", value=col1, inline=False)
+    e.add_field(name=f"Rank {mid+1}–{len(lines)}", value=col2, inline=False)
+    e.set_footer(text="Top = highest confidence · /pick for the single best bet")
     return e
 
 # ---------------------------------------------------------------------------
@@ -295,13 +329,47 @@ async def calibrate(interaction: discord.Interaction, years: float = 2.0, only: 
             pass
     bot.loop.create_task(worker())
 
+@bot.tree.command(name="histtest",
+                  description="Backtest forecast accuracy vs 1-2 years of actual temps")
+@app_commands.describe(city="One city (fast), e.g. LAX. Blank = all cities (slow).",
+                       years="Years of history: 1 or 2 (default 1)",
+                       bucket="Bracket width in °F (1 or 2, default 2)")
+async def histtest(interaction: discord.Interaction, city: str = "",
+                   years: float = 1.0, bucket: int = 2):
+    only = None
+    if city.strip():
+        c = city.upper().strip()
+        if c not in kb.STATIONS:
+            await interaction.response.send_message(
+                f"Unknown city `{c}`. Options: {', '.join(kb.STATIONS)}", ephemeral=True)
+            return
+        only = [c]
+    bucket = 2 if bucket not in (1, 2) else bucket
+    years = 2.0 if years >= 2 else 1.0
+    scope = only[0] if only else "ALL 20 cities"
+    slow = "" if only else " (several minutes)"
+    await interaction.response.send_message(
+        f"⏳ Historical backtest started — {scope}, {years}y, {bucket}°F bucket{slow}. "
+        f"I'll post the results here when it's done.")
+    channel = interaction.channel
+
+    async def worker():
+        text = await run_blocking(perform_histtest, years, bucket, only)
+        try:
+            for block in chunk_text(text):
+                await channel.send(f"```\n{block}\n```")
+        except Exception:
+            pass
+    bot.loop.create_task(worker())
+
 @bot.tree.command(name="help", description="List commands")
 async def help_cmd(interaction: discord.Interaction):
     e = discord.Embed(title="Kalshi temp bot — commands", color=0x9B59B6)
     e.add_field(name="/pick", value="The single best bet (city, side, bracket, edge).", inline=False)
-    e.add_field(name="/scan", value="Full 20-city ranking + top pick(s). Options: day, bucket, top, kalshi.", inline=False)
+    e.add_field(name="/scan", value="Full ranking of all 40 (each city's high AND low) + top pick(s). Options: day, bucket, top, kalshi.", inline=False)
     e.add_field(name="/city code:LAX", value="Detailed forecast + edge for one city.", inline=False)
-    e.add_field(name="/backtest", value="Hit rate, calibration and P&L of your logged picks.", inline=False)
+    e.add_field(name="/histtest", value="Backtest forecast accuracy vs 1-2yr of real temps (high & low, per city). Options: city, years, bucket.", inline=False)
+    e.add_field(name="/backtest", value="Hit rate, calibration and P&L of your logged live picks.", inline=False)
     e.add_field(name="/calibrate", value="Rebuild per-station sigmas (slow, runs in background).", inline=False)
     e.set_footer(text="Common options — day: 0 today / 1 tomorrow · bucket: 1 or 2 °F")
     await interaction.response.send_message(embed=e, ephemeral=True)
