@@ -329,42 +329,32 @@ async def calibrate(interaction: discord.Interaction, years: float = 2.0, only: 
             pass
     bot.loop.create_task(worker())
 
-@bot.tree.command(name="histtest",
-                  description="Backtest forecast accuracy vs 1-2 years of actual temps")
+@bot.tree.command(name="histtest", description="Backtest forecast accuracy vs 1-2 years of actual temps")
 @app_commands.describe(city="One city (fast), e.g. LAX. Blank = all cities (slow).",
                        years="Years of history: 1 or 2 (default 1)",
-                       bucket="Bracket width in °F (1 or 2, default 2)")
-async def histtest(interaction:async def histtest(interaction: discord.Interaction, city: str = "",
-                   years: float = 1.0, bucket: int = 2):
+                       bucket="Bracket width in degrees F (1 or 2, default 2)")
+async def histtest(interaction: discord.Interaction, city: str = "", years: float = 1.0, bucket: int = 2):
     only = None
     if city and city.strip():
         c = city.upper().strip()
-        if c not in kb.STATIONS: discord.Interaction, city: str = "",
-                   years: float = 1.0, bucket: int = 2):
-    only = None
-    if city.strip():
-        c = city.upper().strip()
         if c not in kb.STATIONS:
-            await interaction.response.send_message(
-                f"Unknown city `{c}`. Options: {', '.join(kb.STATIONS)}", ephemeral=True)
+            await interaction.response.send_message(f"Unknown city: {c}", ephemeral=True)
             return
         only = [c]
     bucket = 2 if bucket not in (1, 2) else bucket
     years = 2.0 if years >= 2 else 1.0
     scope = only[0] if only else "ALL 20 cities"
-    slow = "" if only else " (several minutes)"
+    slow = "" if only else " (5-10 min)"
     await interaction.response.send_message(
-        f"⏳ Historical backtest started — {scope}, {years}y, {bucket}°F bucket{slow}. "
-        f"I'll post the results here when it's done.")
+        f"Testing {scope}, {years}y, {bucket}F bucket{slow}. Results coming soon...")
     channel = interaction.channel
-
     async def worker():
         text = await run_blocking(perform_histtest, years, bucket, only)
-        try:
-            for block in chunk_text(text):
+        for block in chunk_text(text):
+            try:
                 await channel.send(f"```\n{block}\n```")
-        except Exception:
-            pass
+            except Exception:
+                pass
     bot.loop.create_task(worker())
 
 @bot.tree.command(name="help", description="List commands")
