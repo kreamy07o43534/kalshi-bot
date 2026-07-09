@@ -334,7 +334,12 @@ async def calibrate(interaction: discord.Interaction, years: float = 2.0, only: 
 @app_commands.describe(city="One city (fast), e.g. LAX. Blank = all cities (slow).",
                        years="Years of history: 1 or 2 (default 1)",
                        bucket="Bracket width in °F (1 or 2, default 2)")
-async def histtest(interaction: discord.Interaction, city: str = "",
+async def histtest(interaction:async def histtest(interaction: discord.Interaction, city: str = "",
+                   years: float = 1.0, bucket: int = 2):
+    only = None
+    if city and city.strip():
+        c = city.upper().strip()
+        if c not in kb.STATIONS: discord.Interaction, city: str = "",
                    years: float = 1.0, bucket: int = 2):
     only = None
     if city.strip():
