@@ -719,9 +719,22 @@ def cmd_backtest(args):
 def cmd_histtest(args):
     codes = args.only if args.only else list(STATIONS.keys())
     half = args.bucket / 2.0
-    end = datetime.now(timezone.utc)
-    start = end - timedelta(days=int(365 * args.years))
-    print(f"\nHistorical accuracy test — {args.years}y, {args.bucket}F bucket")
+    
+    # Parse date range
+    if args.start and args.end:
+        try:
+            start = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            end = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            print("Date format error. Use YYYY-MM-DD (e.g., 2024-07-01)")
+            return
+    else:
+        # Default: last N years
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=int(365 * args.years))
+    
+    days_span = (end - start).days
+    print(f"\nHistorical accuracy test — {days_span} days ({start.strftime('%Y-%m-%d')} to {end.strftime('%Y-%m-%d')}), {args.bucket}F bucket")
     print("(Open-Meteo archived forecast vs IEM actual settlement temps)\n")
     tot = dict(hh=0, hn=0, hae=0.0, lh=0, ln=0, lae=0.0)
     per = []
@@ -797,8 +810,10 @@ def build_parser():
     b.add_argument("--bucket", type=int, default=2, choices=[1, 2])
     b.set_defaults(func=cmd_backtest)
 
-    h = sub.add_parser("histtest", help="test forecast accuracy vs 1-2yr of actual temps")
-    h.add_argument("--years", type=float, default=1.0, help="years of history (1 or 2)")
+    h = sub.add_parser("histtest", help="test forecast accuracy vs historical temps")
+    h.add_argument("--years", type=float, default=1.0, help="years of history (1 or 2, default 1)")
+    h.add_argument("--start", type=str, default=None, help="start date YYYY-MM-DD (overrides --years)")
+    h.add_argument("--end", type=str, default=None, help="end date YYYY-MM-DD (overrides --years)")
     h.add_argument("--bucket", type=int, default=2, choices=[1, 2])
     h.add_argument("--only", nargs="*", default=None, help="subset of city codes")
     h.set_defaults(func=cmd_histtest)

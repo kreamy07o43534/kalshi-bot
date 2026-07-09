@@ -117,13 +117,13 @@ def perform_calibrate(years, only):
         kb.cmd_calibrate(a)
     return buf.getvalue()
 
-def perform_histtest(years, bucket, only):
+def perform_histtest(years, bucket, only, start, end):
     import io, contextlib
     buf = io.StringIO()
 
     class A:
         pass
-    a = A(); a.years = years; a.bucket = bucket; a.only = only
+    a = A(); a.years = years; a.bucket = bucket; a.only = only; a.start = start; a.end = end
     with contextlib.redirect_stdout(buf):
         kb.cmd_histtest(a)
     return buf.getvalue()
@@ -329,11 +329,14 @@ async def calibrate(interaction: discord.Interaction, years: float = 2.0, only: 
             pass
     bot.loop.create_task(worker())
 
-@bot.tree.command(name="histtest", description="Backtest forecast accuracy vs 1-2 years of actual temps")
+@bot.tree.command(name="histtest", description="Backtest forecast accuracy vs custom date range")
 @app_commands.describe(city="One city code (e.g. LAX), or '20' for all 20 cities (slow).",
-                       years="Years of history: 1 or 2 (default 1)",
+                       start="Start date YYYY-MM-DD (e.g. 2024-07-01). If blank, uses --years.",
+                       end="End date YYYY-MM-DD (e.g. 2025-07-01). If blank, uses --years.",
+                       years="Years of history if no dates given (1 or 2, default 1)",
                        bucket="Bracket width in degrees F (1 or 2, default 2)")
-async def histtest(interaction: discord.Interaction, city: str = "20", years: float = 1.0, bucket: int = 2):
+async def histtest(interaction: discord.Interaction, city: str = "20", start: str = "",
+                   end: str = "", years: float = 1.0, bucket: int = 2):
     only = None
     if city != "20":
         c = city.upper().strip()
@@ -344,12 +347,13 @@ async def histtest(interaction: discord.Interaction, city: str = "20", years: fl
     bucket = 2 if bucket not in (1, 2) else bucket
     years = 2.0 if years >= 2 else 1.0
     scope = only[0] if only else "ALL 20 cities"
+    range_label = f"{start} to {end}" if (start and end) else f"{years}y"
     slow = "" if only else " (5-10 min)"
     await interaction.response.send_message(
-        f"Testing {scope}, {years}y, {bucket}F bucket{slow}. Results coming soon...")
+        f"Testing {scope}, {range_label}, {bucket}F bucket{slow}. Results coming soon...")
     channel = interaction.channel
     async def worker():
-        text = await run_blocking(perform_histtest, years, bucket, only)
+        text = await run_blocking(perform_histtest, years, bucket, only, start or None, end or None)
         for block in chunk_text(text):
             try:
                 await channel.send(f"```\n{block}\n```")
